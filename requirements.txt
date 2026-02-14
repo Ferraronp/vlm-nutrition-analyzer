@@ -1,0 +1,14 @@
+# .env
+python-dotenv
+
+# ml
+transformers
+torch
+qwen_vl_utils
+groq
+bitsandbytes
+accelerate
+
+# web
+fastapi
+uvicorn
