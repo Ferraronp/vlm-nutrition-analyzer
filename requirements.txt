@@ -12,3 +12,7 @@ accelerate
 # web
 fastapi
 uvicorn
+
+# metrics
+psutil
+gputil
