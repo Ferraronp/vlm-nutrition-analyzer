@@ -12,6 +12,7 @@ accelerate
 # web
 fastapi
 uvicorn
+python-multipart
 
 # metrics
 psutil

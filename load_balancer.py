@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 import uuid
 import random
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, status, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import aiohttp
 import async_timeout
@@ -168,7 +168,7 @@ class LoadBalancer:
                 
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
             
-    async def forward_request(self, image_url: str) -> dict:
+    async def forward_request(self, image_url: Optional[str] = None, image_file: Optional[UploadFile] = None) -> dict:
         """Переслать запрос на один из экземпляров"""
         instance = self.get_next_instance()
         if not instance:
@@ -184,7 +184,6 @@ class LoadBalancer:
             )
             
         try:
-            target_url = f"{instance.url}/?image_url={image_url}"
             headers = {}
             
             # Добавляем cookies если они есть
@@ -193,18 +192,58 @@ class LoadBalancer:
                 
             logger.info(f"Forwarding request to {instance.name}")
             
-            async with async_timeout.timeout(REQUEST_TIMEOUT):
-                async with self.session.get(target_url, headers=headers) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        logger.info(f"Request successful via {instance.name}")
-                        return data
-                    else:
-                        error_text = await response.text()
-                        raise HTTPException(
-                            status_code=response.status,
-                            detail=f"Instance returned error: {error_text}"
-                        )
+            # Если передан URL
+            if image_url:
+                target_url = f"{instance.url}/?image_url={image_url}"
+                
+                async with async_timeout.timeout(REQUEST_TIMEOUT):
+                    async with self.session.get(target_url, headers=headers) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            logger.info(f"Request successful via {instance.name}")
+                            return data
+                        else:
+                            error_text = await response.text()
+                            raise HTTPException(
+                                status_code=response.status,
+                                detail=f"Instance returned error: {error_text}"
+                            )
+            
+            # Если передан файл
+            elif image_file:
+                # Создаем form-data для пересылки файла
+                form_data = aiohttp.FormData()
+                
+                # Читаем содержимое файла
+                file_content = await image_file.read()
+                
+                # Добавляем файл в form-data
+                form_data.add_field(
+                    'image_file',
+                    file_content,
+                    filename=image_file.filename,
+                    content_type=image_file.content_type or 'application/octet-stream'
+                )
+                
+                target_url = f"{instance.url}/"
+                
+                async with async_timeout.timeout(REQUEST_TIMEOUT):
+                    async with self.session.post(target_url, headers=headers, data=form_data) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            logger.info(f"File upload request successful via {instance.name}")
+                            return data
+                        else:
+                            error_text = await response.text()
+                            raise HTTPException(
+                                status_code=response.status,
+                                detail=f"Instance returned error: {error_text}"
+                            )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Either image_url or image_file must be provided"
+                )
                         
         except asyncio.TimeoutError:
             logger.error(f"Request timeout to {instance.name}")
@@ -300,10 +339,43 @@ async def get_instance(instance_id: str):
 
 
 @app.get("/analyze")
-async def analyze_food(image_url: str = Query(..., description="URL of the food image")):
-    """Анализировать изображение пищи через балансировщик"""
+async def analyze_food_get(image_url: str = Query(..., description="URL of the food image")):
+    """Анализировать изображение пищи через балансировщик (GET-запрос)"""
     try:
-        result = await lb.forward_request(image_url)
+        result = await lb.forward_request(image_url=image_url)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to analyze food: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to analyze food: {str(e)}"
+        )
+
+
+@app.post("/analyze")
+async def analyze_food_post(
+    image_url: str = Form(None, description="URL of the food image"),
+    image_file: UploadFile = File(None, description="Food image file")
+):
+    """Анализировать изображение пищи через балансировщик (POST-запрос)"""
+    # Проверяем, что передан хотя бы один параметр
+    if not image_url and not image_file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either image_url or image_file must be provided"
+        )
+    
+    # Проверяем, что передан только один параметр
+    if image_url and image_file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only one of image_url or image_file should be provided"
+        )
+    
+    try:
+        result = await lb.forward_request(image_url=image_url, image_file=image_file)
         return result
     except HTTPException:
         raise
