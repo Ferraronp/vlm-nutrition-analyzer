@@ -29,3 +29,8 @@ TEMPERATURE = 0.3
 MAX_COMPLETION_TOKENS = 65536
 TOP_P = 1
 REASONING_EFFORT = "high"
+
+# Batching configuration
+ENABLE_BATCHING = True
+BATCH_TIMEOUT = 2.0  # seconds to collect requests before processing
+MAX_BATCH_SIZE = 8   # maximum number of images in one batch
