@@ -21,11 +21,25 @@
 
 ## 🔧 Установка и запуск в Google Colab
 
+### ⚠️ ВАЖНО: Необходимость Cookies
+
+Для подключения к Google Colab прокси требуется специальный cookie-токен `colab-runtime-proxy-token`. Без этого токена API не будет доступно из внешней сети.
+
+### Как получить cookies:
+
+1. Запустите notebook в Google Colab
+2. После появления публичного URL, откройте его в браузере
+3. Нажмите F12 или Ctrl+Shift+I для открытия DevTools
+4. Перейдите на вкладку **Network** (Сеть)
+5. Обновите страницу (F5)
+6. Найдите любой запрос к серверу (например, `/health`)
+7. В заголовках запроса найдите `cookie` и скопируйте значение `colab-runtime-proxy-token`
+
 ### Быстрый старт (одна сессия)
 
 1. Откройте [colab.ipynb](colab.ipynb) в Google Colab
 2. Запустите все ячейки по порядку
-3. После запуска получите публичный URL
+3. После запуска получите публичный URL в формате: `https://8000-gpu-t4-XXXXXXX.prod.colab.dev`
 
 ### Развертывание нескольких экземпляров (для ускорения)
 
@@ -56,14 +70,16 @@ GROQ_API_KEY="your_groq_api_key_here"
 !python app.py
 ```
 
-#### Шаг 3: Получение URL для каждой сессии
+#### Шаг 3: Получение URL и cookies для каждой сессии
 
-После запуска в каждой сессии получите уникальный URL:
+После запуска в каждой сессии получите уникальный URL в формате:
 
-**Сессия 1**: `https://abc123.loca.lt`  
-**Сессия 2**: `https://def456.loca.lt`  
-**Сессия 3**: `https://ghi789.loca.lt`  
-**Сессия 4**: `https://jkl012.loca.lt`
+**Сессия 1**: `https://8000-gpu-t4-XXXXXXX.prod.colab.dev`  
+**Сессия 2**: `https://8000-gpu-t4-YYYYYYY.prod.colab.dev`  
+**Сессия 3**: `https://8000-gpu-t4-ZZZZZZZ.prod.colab.dev`  
+**Сессия 4**: `https://8000-gpu-t4-WWWWWWW.prod.colab.dev`
+
+Для каждой сессии также получите cookies через DevTools (см. инструкцию выше).
 
 #### Шаг 4: Балансировка нагрузки
 
@@ -208,13 +224,18 @@ python app.py
 ```python
 import requests
 
-# URL одного из ваших экземпляров
-BASE_URL = "https://abc123.loca.lt"
+# URL одного из ваших экземпляров (замените на реальный)
+BASE_URL = "https://8000-gpu-t4-XXXXXXX.prod.colab.dev"
+
+# Необходимые cookies
+cookies = {
+    'colab-runtime-proxy-token': 'your_token_here'
+}
 
 # Анализ через URL изображения
-response = requests.get(f"{BASE_URL}/", params={
-    "image_url": "https://example.com/borscht.jpg"
-})
+response = requests.get(f"{BASE_URL}/", 
+                       params={"image_url": "https://example.com/borscht.jpg"},
+                       cookies=cookies)
 
 result = response.json()
 print(result["data"]["analysis"])
@@ -222,7 +243,7 @@ print(result["data"]["analysis"])
 # Анализ через загрузку файла
 with open('food.jpg', 'rb') as f:
     files = {'file': f}
-    response = requests.post(f"{BASE_URL}/upload", files=files)
+    response = requests.post(f"{BASE_URL}/upload", files=files, cookies=cookies)
 
 result = response.json()
 print(result["data"]["analysis"])
@@ -248,13 +269,15 @@ print(result["data"]["analysis"])
 
 #### Через URL изображения
 ```bash
-curl "https://abc123.loca.lt/?image_url=https://example.com/pizza.jpg"
+curl "https://8000-gpu-t4-XXXXXXX.prod.colab.dev/?image_url=https://example.com/pizza.jpg" \
+  -H "cookie: colab-runtime-proxy-token=your_token_here"
 ```
 
 #### Через загрузку файла
 ```bash
-curl -X POST "https://abc123.loca.lt/upload" \
-  -F "file=@/path/to/your/food.jpg"
+curl -X POST "https://8000-gpu-t4-XXXXXXX.prod.colab.dev/upload" \
+  -F "file=@/path/to/your/food.jpg" \
+  -H "cookie: colab-runtime-proxy-token=your_token_here"
 ```
 
 #### Через балансировщик (URL)
@@ -318,6 +341,7 @@ curl "http://localhost:8080/analyze?image_url=https://example.com/test.jpg"
 ## ⚠️ Важные замечания
 
 - **API ключи**: Храните ваши Groq API ключи в безопасности
+- **Cookies**: Не забудьте получить `colab-runtime-proxy-token` для доступа к Google Colab прокси
 - **Лимиты**: Учитывайте лимиты на бесплатные Google Colab сессии (до 6 часов)
 - **GPU**: Для VLM модели требуется GPU с CUDA
 - **Точность**: Расчеты являются приблизительными и зависят от качества изображения
