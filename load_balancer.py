@@ -152,7 +152,8 @@ class LoadBalancer:
             try:
                 tasks = []
                 for instance in self.instances.values():
-                    tasks.append(self.check_instance_health(instance))
+                    if instance.is_active:
+                        tasks.append(self.check_instance_health(instance))
                     
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)

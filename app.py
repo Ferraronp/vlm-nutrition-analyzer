@@ -94,7 +94,7 @@ async def process_image(image_source: str, is_file: bool = False):
     
     try:
         # Генерация описания через VLM
-        vlm_output = vlm_service.generate(image_source)
+        vlm_output = await vlm_service.generate(image_source)
         
         # Анализ через LLM
         result = llm_service.generate(vlm_output)
