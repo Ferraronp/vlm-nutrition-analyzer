@@ -122,15 +122,9 @@ class LoadBalancer:
             return False
             
         try:
-            health_url = f"{instance.url}/health"
-            headers = {}
-            
-            # Добавляем cookies если они есть
-            if instance.cookies:
-                headers['Cookie'] = '; '.join([f"{k}={v}" for k, v in instance.cookies.items()])
-                
+            health_url = f"{instance.url}health"
             async with async_timeout.timeout(REQUEST_TIMEOUT):
-                async with self.session.get(health_url, headers=headers) as response:
+                async with self.session.get(health_url, cookies=instance.cookies) as response:
                     if response.status == 200:
                         instance.is_active = True
                         instance.failed_attempts = 0
@@ -184,12 +178,6 @@ class LoadBalancer:
             )
             
         try:
-            headers = {}
-            
-            # Добавляем cookies если они есть
-            if instance.cookies:
-                headers['Cookie'] = '; '.join([f"{k}={v}" for k, v in instance.cookies.items()])
-                
             logger.info(f"Forwarding request to {instance.name}")
             
             # Если передан URL
@@ -197,7 +185,7 @@ class LoadBalancer:
                 target_url = f"{instance.url}/?image_url={image_url}"
                 
                 async with async_timeout.timeout(REQUEST_TIMEOUT):
-                    async with self.session.get(target_url, headers=headers) as response:
+                    async with self.session.get(target_url, cookies=instance.cookies) as response:
                         if response.status == 200:
                             data = await response.json()
                             logger.info(f"Request successful via {instance.name}")
@@ -219,16 +207,16 @@ class LoadBalancer:
                 
                 # Добавляем файл в form-data
                 form_data.add_field(
-                    'image_file',
+                    'file',
                     file_content,
                     filename=image_file.filename,
                     content_type=image_file.content_type or 'application/octet-stream'
                 )
                 
-                target_url = f"{instance.url}/"
+                target_url = f"{instance.url}upload"
                 
                 async with async_timeout.timeout(REQUEST_TIMEOUT):
-                    async with self.session.post(target_url, headers=headers, data=form_data) as response:
+                    async with self.session.post(target_url, cookies=instance.cookies, data=form_data) as response:
                         if response.status == 200:
                             data = await response.json()
                             logger.info(f"File upload request successful via {instance.name}")
@@ -360,6 +348,8 @@ async def analyze_food_post(
     image_file: UploadFile = File(None, description="Food image file")
 ):
     """Анализировать изображение пищи через балансировщик (POST-запрос)"""
+    if image_url == "string":
+        image_url = None
     # Проверяем, что передан хотя бы один параметр
     if not image_url and not image_file:
         raise HTTPException(
