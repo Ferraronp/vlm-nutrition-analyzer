@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 HEALTH_CHECK_INTERVAL = 30  # секунды
 MAX_FAILED_ATTEMPTS = 3
-REQUEST_TIMEOUT = 30  # секунды
+REQUEST_TIMEOUT = 120  # секунды
 
 
 class Instance(BaseModel):

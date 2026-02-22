@@ -54,12 +54,25 @@ class VLMService:
                 texts.append(text)
                 images_inputs.append(image_inputs)
                 videos_inputs.append(video_inputs)
-            
+
+            flat_images = []
+            for sublist in images_inputs:
+                if sublist:
+                    flat_images.extend(sublist)
+            flat_videos = []
+            for sublist in videos_inputs:
+                if sublist:
+                    flat_videos.extend(sublist)
+            if not flat_videos:
+                flat_videos = None
+            if not flat_images:
+                flat_images = None
+
             # Обработка батча
             inputs = self.processor(
                 text=texts,
-                images=images_inputs,
-                videos=videos_inputs,
+                images=flat_images,
+                videos=flat_videos,
                 padding=True,
                 return_tensors="pt",
             )

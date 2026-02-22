@@ -12,6 +12,7 @@ from config import HOST, PORT, LOG_LEVEL
 from vlm_service import vlm_service
 from llm_service import llm_service
 from memory_monitor import router as metrics_router
+from batch_manager import initialize_batch_manager, shutdown_batch_manager
 
 # Для сбора метрик запросов
 request_times = []
@@ -30,9 +31,11 @@ SUPPORTED_IMAGE_FORMATS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'}
 async def lifespan(app: FastAPI):
     # Startup
     print("Starting Food Nutrition Analysis API...")
+    initialize_batch_manager()
     yield
     # Shutdown
     print("Shutting down...")
+    shutdown_batch_manager()
 
 
 app = FastAPI(
