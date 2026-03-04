@@ -1,13 +1,14 @@
 import torch
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
+from huggingface_hub import hf_hub_download
+from llama_cpp import Llama
+from llama_cpp.llama_chat_format import Qwen25VLChatHandler
 
-from config import MODEL_NAME, TORCH_DTYPE, DEVICE_MAP
+from config import MODEL_NAME, MODEL_FILE, MMPROJ_FILE
 
 
 class ModelLoader:
     _instance = None
     _model = None
-    _processor = None
 
     def __new__(cls):
         if cls._instance is None:
@@ -15,29 +16,26 @@ class ModelLoader:
         return cls._instance
 
     def load_model(self):
-        if self._model is None or self._processor is None:
-            print("Loading model and processor...")
-            # Quantization config for 4-bit loading
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=TORCH_DTYPE,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4"
-            )
+        if self._model is None:
+            print("Loading model...")
+            model_path = hf_hub_download(repo_id=MODEL_NAME, filename=MODEL_FILE)
+            mmproj_path = hf_hub_download(repo_id=MODEL_NAME, filename=MMPROJ_FILE)
+            handler = Qwen25VLChatHandler(clip_model_path=mmproj_path)
 
             # Load model
-            self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                MODEL_NAME,
-                torch_dtype=TORCH_DTYPE,
-                device_map=DEVICE_MAP,
-                quantization_config=quantization_config
+            self._model = Llama(
+                model_path=model_path,
+                chat_handler=handler,
+                n_ctx=2048,  # Размер контекста
+                n_threads=8,  # Количество потоков CPU
+                n_gpu_layers=-1,  # -1 для использования всех слоев на GPU (если есть GPU)
+                verbose=False,
+                logits_all=True
             )
 
-            # Load processor
-            self._processor = AutoProcessor.from_pretrained(MODEL_NAME)
-            print("Model and processor loaded successfully!")
+            print("Model loaded successfully!")
 
-        return self._model, self._processor
+        return self._model
 
 
 # Global instance

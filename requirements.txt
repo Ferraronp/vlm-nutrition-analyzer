@@ -2,12 +2,10 @@
 python-dotenv
 
 # ml
-transformers
-torch
-qwen_vl_utils
+huggingface_hub
 groq
-bitsandbytes
 accelerate
+Pillow
 
 # web
 fastapi

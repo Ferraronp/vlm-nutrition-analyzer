@@ -1,216 +1,130 @@
-from qwen_vl_utils import process_vision_info
-import torch
 import asyncio
 import logging
-from typing import List, Dict, Optional
+import base64
+import requests
+from io import BytesIO
+from typing import List
 from concurrent.futures import ThreadPoolExecutor
 import time
+import os
 
 from model_loader import model_loader
 from prompts import VLM_SYSTEM_PROMPT
-from config import MAX_NEW_TOKENS, ENABLE_BATCHING
+from config import MAX_NEW_TOKENS, TEMPERATURE, TOP_P, ENABLE_BATCHING
 from batch_manager import batch_manager
 
 logger = logging.getLogger(__name__)
 
 
+def image_url_to_base64(image_url: str) -> str:
+    """Конвертирует изображение по URL (http/https или file) в base64."""
+    if image_url.startswith("file://"):
+        file_path = image_url[7:]  # удаляем "file://"
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Local file not found: {file_path}")
+        with open(file_path, "rb") as f:
+            image_data = f.read()
+    elif image_url.startswith(("http://", "https://")):
+        response = requests.get(image_url, timeout=30)
+        response.raise_for_status()
+        image_data = response.content
+    else:
+        raise ValueError(f"Unsupported URL scheme: {image_url}")
+
+    return base64.b64encode(image_data).decode('utf-8')
+
+
 class VLMService:
     def __init__(self):
-        self.model, self.processor = model_loader.load_model()
+        self.model = model_loader.load_model()
         self.executor = ThreadPoolExecutor(max_workers=4)
-        
-    def generate_batch(self, image_urls: List[str]) -> List[str]:
-        """Обработка нескольких изображений одновременно"""
+
+    def generate_single(self, image_url: str) -> str:
+        """Обработка одного изображения через llama.cpp."""
         start_time = time.time()
         try:
-            messages_batch = []
-            
-            # Подготовка сообщений для каждого изображения
-            for image_url in image_urls:
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "image": image_url,
-                            },
-                            {"type": "text", "text": VLM_SYSTEM_PROMPT},
-                        ],
-                    }
-                ]
-                messages_batch.append(messages)
-            
-            # Подготовка inputs для батча
-            texts = []
-            images_inputs = []
-            videos_inputs = []
-            
-            for messages in messages_batch:
-                text = self.processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-                image_inputs, video_inputs = process_vision_info(messages)
-                texts.append(text)
-                images_inputs.append(image_inputs)
-                videos_inputs.append(video_inputs)
+            image_base64 = image_url_to_base64(image_url)
 
-            flat_images = []
-            for sublist in images_inputs:
-                if sublist:
-                    flat_images.extend(sublist)
-            flat_videos = []
-            for sublist in videos_inputs:
-                if sublist:
-                    flat_videos.extend(sublist)
-            if not flat_videos:
-                flat_videos = None
-            if not flat_images:
-                flat_images = None
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": VLM_SYSTEM_PROMPT
+                        }
+                    ]
+                }
+            ]
 
-            # Обработка батча
-            inputs = self.processor(
-                text=texts,
-                images=flat_images,
-                videos=flat_videos,
-                padding=True,
-                return_tensors="pt",
+            response = self.model.create_chat_completion(
+                messages=messages,
+                max_tokens=MAX_NEW_TOKENS,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
             )
-            inputs = inputs.to("cuda")
-            
-            # Генерация для всего батча
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=MAX_NEW_TOKENS,
-                    use_cache=True,
-                    do_sample=False
-                )
-            
-            # Обработка результатов
-            results = []
-            for i, (in_ids, out_ids) in enumerate(zip(inputs.input_ids, generated_ids)):
-                generated_ids_trimmed = out_ids[len(in_ids):]
-                output_text = self.processor.decode(
-                    generated_ids_trimmed,
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False
-                )
-                results.append(output_text)
-            
-            logger.info(f"Processed batch of {len(image_urls)} images in {time.time() - start_time:.2f}s")
-            return results
-            
+
+            output_text = response['choices'][0]['message']['content']
+            print(time.time() - start_time)
+            return output_text.strip()
+
         except Exception as e:
-            logger.error(f"Error in batch processing: {e}")
-            # Fallback: обработка по одному
-            return self._process_individually(image_urls)
-    
-    def _process_individually(self, image_urls: List[str]) -> List[str]:
-        """Обработка изображений по одному (fallback)"""
+            logger.error(f"Error in generate_single: {e}")
+            return f"Error: {str(e)}"
+
+    def generate_batch(self, image_urls: List[str]) -> List[str]:
+        """Последовательная обработка нескольких изображений."""
+        start_time = time.time()
         results = []
-        for image_url in image_urls:
+        for url in image_urls:
             try:
-                result = self.generate_single(image_url)
-                results.append(result)
+                results.append(self.generate_single(url))
             except Exception as e:
-                logger.error(f"Error processing single image {image_url}: {e}")
+                logger.error(f"Error processing {url}: {e}")
                 results.append(f"Error: {str(e)}")
+        logger.info(f"Processed batch of {len(image_urls)} images in {time.time() - start_time:.2f}s")
         return results
-    
-    def generate_single(self, image_url: str) -> str:
-        """Обработка одного изображения (как в оригинале)"""
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "image": image_url,
-                    },
-                    {"type": "text", "text": VLM_SYSTEM_PROMPT},
-                ],
-            }
-        ]
 
-        # Preparation for inference
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to("cuda")
-
-        # Inference: Generation of the output
-        generated_ids = self.model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            use_cache=True,
-            do_sample=False
-        )
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        output_text = self.processor.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False
-        )
-
-        return output_text[0]
-    
     async def generate(self, image_url: str) -> str:
-        """Основной метод генерации с поддержкой батчинга"""
+        """Основной метод с поддержкой батчинга."""
         if ENABLE_BATCHING:
             try:
-                # Используем batch_manager для сбора запросов
-                result = await batch_manager.add_request(image_url)
-                return result
+                return await batch_manager.add_request(image_url)
             except Exception as e:
-                logger.error(f"Error using batch manager: {e}")
-                # Fallback на прямую обработку
+                logger.error(f"Batch manager error: {e}")
                 return await self._generate_direct(image_url)
         else:
-            # Прямая обработка без батчинга
             return await self._generate_direct(image_url)
-    
+
     async def _generate_direct(self, image_url: str) -> str:
-        """Прямая обработка без батчинга (асинхронная обертка)"""
+        """Асинхронная обёртка для прямого вызова."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(self.executor, self.generate_single, image_url)
 
 
-# Global instance
+# Глобальный экземпляр
 vlm_service = VLMService()
 
 
 async def process_batch_callback(batch_requests):
-    """Callback для обработки батчей из batch_manager"""
+    """Callback для batch_manager."""
     try:
-        # Собираем URL изображений из запросов
         image_urls = [req.image_url for req in batch_requests]
-        
-        # Обрабатываем батч
         results = vlm_service.generate_batch(image_urls)
-        
-        # Распределяем результаты по запросам
-        for request, result in zip(batch_requests, results):
-            if not request.future.done():
-                request.future.set_result(result)
-                
+        for req, res in zip(batch_requests, results):
+            if not req.future.done():
+                req.future.set_result(res)
     except Exception as e:
-        logger.error(f"Error in batch callback: {e}")
-        # Устанавливаем ошибку для всех запросов в батче
-        for request in batch_requests:
-            if not request.future.done():
-                request.future.set_exception(e)
+        logger.error(f"Batch callback error: {e}")
+        for req in batch_requests:
+            if not req.future.done():
+                req.future.set_exception(e)
 
 
-# Устанавливаем callback для batch_manager
 batch_manager.process_batch_callback = process_batch_callback

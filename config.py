@@ -11,9 +11,9 @@ if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY not found in environment variables")
 
 # Model configuration
-MODEL_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
-DEVICE_MAP = "auto"
-TORCH_DTYPE = torch.float16
+MODEL_NAME = "unsloth/Qwen2.5-VL-7B-Instruct-GGUF"
+MODEL_FILE = "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"
+MMPROJ_FILE = "mmproj-F16.gguf"
 
 # Server configuration
 HOST = "0.0.0.0"
@@ -24,7 +24,7 @@ LOG_LEVEL = "info"
 # for vlm
 MAX_NEW_TOKENS = 300
 
-# for llm
+# for model
 TEMPERATURE = 0.3
 MAX_COMPLETION_TOKENS = 65536
 TOP_P = 1
