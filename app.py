@@ -7,6 +7,8 @@ import os
 import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
+import json
+from pydantic import BaseModel
 
 from config import HOST, PORT, LOG_LEVEL
 from vlm_service import vlm_service
@@ -26,6 +28,29 @@ TEMP_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 # Поддерживаемые форматы изображений
 SUPPORTED_IMAGE_FORMATS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'}
 
+class FoodItem(BaseModel):
+    name: str
+    portion: str
+    calories: float
+    protein: float
+    fat: float
+    carbs: float
+
+class Totals(BaseModel):
+    calories: float
+    protein: float
+    fat: float
+    carbs: float
+
+class NutritionAnalysis(BaseModel):
+    assumption: str
+    items: list[FoodItem]
+    totals: Totals
+    disclaimer: str
+
+class AnalysisResponse(BaseModel):
+    status: str
+    data: dict  # или можно сделать более точную модель, если нужно
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -89,40 +114,40 @@ def cleanup_temp_file(file_path: str):
 
 
 async def process_image(image_source: str, is_file: bool = False):
-    """Обрабатывает изображение и возвращает результат анализа."""
     global request_count, error_count, request_times
-    
+
     request_count += 1
     start_time = time.time()
-    
+
     try:
-        # Генерация описания через VLM
         vlm_output = await vlm_service.generate(image_source)
-        
-        # Анализ через LLM
-        result = llm_service.generate(vlm_output)
-        
-        # Сохраняем время ответа
+        result_str = llm_service.generate(vlm_output)  # строка JSON от LLM
+
+        # Парсим JSON в словарь
+        try:
+            analysis_obj = json.loads(result_str)
+        except json.JSONDecodeError:
+            # Если не удалось распарсить, возвращаем как есть (например, уточнение)
+            # Но можно выбросить ошибку
+            analysis_obj = {"raw": result_str}
+
         elapsed = time.time() - start_time
         request_times.append(elapsed)
-        # Оставляем только последние 1000 запросов
         if len(request_times) > 1000:
             request_times.pop(0)
-        
+
         return {
             "status": "success",
             "data": {
-                "analysis": result,
-                "vlm_output": vlm_output  # можно убрать, если не нужно
+                "analysis": analysis_obj,  # теперь это объект, а не строка
+                "vlm_output": vlm_output
             }
         }
-        
+
     except HTTPException:
-        # Пробрасываем HTTP исключения дальше
         raise
     except Exception as e:
         error_count += 1
-        # Логируем ошибку
         print(f"Error processing request: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -130,7 +155,7 @@ async def process_image(image_source: str, is_file: bool = False):
         )
 
 
-@app.post("/upload", response_model=dict)
+@app.post("/upload", response_model=AnalysisResponse)
 async def upload_and_analyze_food(file: UploadFile = File(...)):
     """
     Загрузить изображение блюда напрямую и получить анализ пищевой ценности.
@@ -153,7 +178,7 @@ async def upload_and_analyze_food(file: UploadFile = File(...)):
         cleanup_temp_file(temp_file_path)
 
 
-@app.get("/", response_model=dict)
+@app.get("/", response_model=AnalysisResponse)
 async def analyze_food(
     image_url: str = Query(None, description="URL of the food image"),
     image_file: UploadFile = File(None, description="Food image file")

@@ -26,7 +26,10 @@ class LLMService:
             top_p=TOP_P,
             reasoning_effort=REASONING_EFFORT,
             stream=False,
-            stop=None
+            stop=None,
+            response_format={
+                "type": "json_object"
+            }
         )
 
         return str(completion.choices[0].message.content)

@@ -61,6 +61,35 @@ class InstanceCreate(BaseModel):
         return v
 
 
+class FoodItem(BaseModel):
+    name: str
+    portion: str
+    calories: float
+    protein: float
+    fat: float
+    carbs: float
+
+class Totals(BaseModel):
+    calories: float
+    protein: float
+    fat: float
+    carbs: float
+
+class NutritionAnalysis(BaseModel):
+    assumption: str
+    items: list[FoodItem]
+    totals: Totals
+    disclaimer: str
+
+class AnalysisData(BaseModel):
+    analysis: NutritionAnalysis | dict  # допускаем как структурированный объект, так и уточняющий ответ (например, {"clarification_required": ...})
+    vlm_output: str
+
+class AnalysisResponse(BaseModel):
+    status: str
+    data: AnalysisData
+
+
 class LoadBalancer:
     """Класс балансировщика нагрузки"""
     
@@ -327,7 +356,7 @@ async def get_instance(instance_id: str):
     return instance
 
 
-@app.get("/analyze")
+@app.get("/analyze", response_model=AnalysisResponse)
 async def analyze_food_get(image_url: str = Query(..., description="URL of the food image")):
     """Анализировать изображение пищи через балансировщик (GET-запрос)"""
     try:
@@ -342,8 +371,7 @@ async def analyze_food_get(image_url: str = Query(..., description="URL of the f
             detail=f"Failed to analyze food: {str(e)}"
         )
 
-
-@app.post("/analyze")
+@app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_food_post(
     image_url: str = Form(None, description="URL of the food image"),
     image_file: UploadFile = File(None, description="Food image file")
