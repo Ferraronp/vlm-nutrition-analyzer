@@ -38,6 +38,7 @@ class Instance(BaseModel):
     failed_attempts: int = 0
     last_check: Optional[datetime] = None
     created_at: datetime = datetime.now()
+    in_flight: int = 0  # запросы в полёте прямо сейчас (считает LB)
 
     class Config:
         schema_extra = {
@@ -54,7 +55,7 @@ class InstanceCreate(BaseModel):
     url: HttpUrl
     cookies: Optional[Dict[str, str]] = None
     name: Optional[str] = None
-
+    
     @validator('cookies')
     def validate_cookies(cls, v):
         if v and not isinstance(v, dict):
@@ -93,23 +94,32 @@ class AnalysisResponse(BaseModel):
 
 class LoadBalancer:
     """Класс балансировщика нагрузки"""
-
+    
     def __init__(self):
         self.instances: Dict[str, Instance] = {}
         self.current_index = 0
         self.session: Optional[aiohttp.ClientSession] = None
-
+        self.health_session: Optional[aiohttp.ClientSession] = None  # отдельная сессия для health check
+        
     async def start(self):
         """Запустить балансировщик и сессию aiohttp"""
-        self.session = aiohttp.ClientSession()
+        # Явные таймауты: connect 10s, read 30s — туннели (loca.lt/ngrok) могут медленно коннектиться
+        timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=30)
+        self.session = aiohttp.ClientSession(timeout=timeout)
+        # Health check сессия отдельная — чтобы не застревать в очереди коннектов
+        # пока основная сессия занята inference-запросом
+        health_timeout = aiohttp.ClientTimeout(total=8, connect=5, sock_read=5)
+        self.health_session = aiohttp.ClientSession(timeout=health_timeout)
         logger.info("Load balancer started")
-
+        
     async def stop(self):
         """Остановить балансировщик и закрыть сессию"""
         if self.session:
             await self.session.close()
+        if self.health_session:
+            await self.health_session.close()
         logger.info("Load balancer stopped")
-
+        
     def add_instance(self, instance_data: InstanceCreate) -> Instance:
         """Добавить новый экземпляр"""
         instance_id = str(uuid.uuid4())
@@ -122,7 +132,7 @@ class LoadBalancer:
         self.instances[instance_id] = instance
         logger.info(f"Added instance: {instance.name} ({instance.url})")
         return instance
-
+        
     def remove_instance(self, instance_id: str) -> bool:
         """Удалить экземпляр"""
         if instance_id in self.instances:
@@ -130,39 +140,44 @@ class LoadBalancer:
             logger.info(f"Removed instance: {instance.name}")
             return True
         return False
-
+        
     def get_active_instances(self) -> List[Instance]:
         """Получить список активных экземпляров"""
         return [inst for inst in self.instances.values() if inst.is_active]
-
+        
     def get_next_instance(self) -> Optional[Instance]:
         """Получить следующий экземпляр по round-robin"""
         active_instances = self.get_active_instances()
         if not active_instances:
             return None
-
+            
         # Round-robin выбор
         instance = active_instances[self.current_index % len(active_instances)]
         self.current_index += 1
         return instance
-
+        
     async def check_instance_health(self, instance: Instance) -> bool:
         """Проверить состояние экземпляра"""
-        if not self.session:
+        if not self.health_session:
             return False
+
+        # Инстанс занят inference — не считаем это смертью, просто пропускаем тик
+        if instance.in_flight > 0:
+            logger.debug(f"Skipping health check for {instance.name}: {instance.in_flight} request(s) in flight")
+            instance.last_check = datetime.now()
+            return True
 
         try:
             health_url = f"{instance.url}health"
-            async with async_timeout.timeout(REQUEST_TIMEOUT):
-                async with self.session.get(health_url, cookies=instance.cookies) as response:
-                    if response.status == 200:
-                        instance.is_active = True
-                        instance.failed_attempts = 0
-                        instance.last_check = datetime.now()
-                        logger.debug(f"Health check passed for {instance.name}")
-                        return True
-                    else:
-                        raise Exception(f"Health check failed with status {response.status}")
+            async with self.health_session.get(health_url, cookies=instance.cookies) as response:
+                if response.status == 200:
+                    instance.is_active = True
+                    instance.failed_attempts = 0
+                    instance.last_check = datetime.now()
+                    logger.debug(f"Health check passed for {instance.name}")
+                    return True
+                else:
+                    raise Exception(f"Health check failed with status {response.status}")
 
         except Exception as e:
             instance.failed_attempts += 1
@@ -175,7 +190,7 @@ class LoadBalancer:
                 logger.warning(f"Health check failed for {instance.name}: {str(e)}")
 
             return False
-
+            
     async def health_check_loop(self):
         """Фоновая задача для проверки состояния экземпляров"""
         while True:
@@ -184,15 +199,15 @@ class LoadBalancer:
                 for instance in self.instances.values():
                     if instance.is_active:
                         tasks.append(self.check_instance_health(instance))
-
+                    
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
-
+                    
             except Exception as e:
                 logger.error(f"Error in health check loop: {str(e)}")
-
+                
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
-
+            
     async def forward_request(self, image_url: Optional[str] = None, image_file: Optional[UploadFile] = None) -> dict:
         """Переслать запрос на один из экземпляров"""
         instance = self.get_next_instance()
@@ -201,20 +216,21 @@ class LoadBalancer:
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="No active instances available"
             )
-
+            
         if not self.session:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Load balancer not initialized"
             )
 
+        instance.in_flight += 1
         try:
-            logger.info(f"Forwarding request to {instance.name}")
-
+            logger.info(f"Forwarding request to {instance.name} (in_flight={instance.in_flight})")
+            
             # Если передан URL
             if image_url:
                 target_url = f"{instance.url}/?image_url={image_url}"
-
+                
                 async with async_timeout.timeout(REQUEST_TIMEOUT):
                     async with self.session.get(target_url, cookies=instance.cookies) as response:
                         if response.status == 200:
@@ -227,25 +243,20 @@ class LoadBalancer:
                                 status_code=response.status,
                                 detail=f"Instance returned error: {error_text}"
                             )
-
+            
             # Если передан файл
             elif image_file:
-                # Создаем form-data для пересылки файла
                 form_data = aiohttp.FormData()
-
-                # Читаем содержимое файла
                 file_content = await image_file.read()
-
-                # Добавляем файл в form-data
                 form_data.add_field(
                     'file',
                     file_content,
                     filename=image_file.filename,
                     content_type=image_file.content_type or 'application/octet-stream'
                 )
-
+                
                 target_url = f"{instance.url}upload"
-
+                
                 async with async_timeout.timeout(REQUEST_TIMEOUT):
                     async with self.session.post(target_url, cookies=instance.cookies, data=form_data) as response:
                         if response.status == 200:
@@ -263,16 +274,17 @@ class LoadBalancer:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Either image_url or image_file must be provided"
                 )
-
+                        
         except asyncio.TimeoutError:
             logger.error(f"Request timeout to {instance.name}")
             raise HTTPException(
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 detail="Request timeout"
             )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Request failed to {instance.name}: {str(e)}")
-            # Помечаем экземпляр как проблемный
             instance.failed_attempts += 1
             if instance.failed_attempts >= MAX_FAILED_ATTEMPTS:
                 instance.is_active = False
@@ -280,6 +292,8 @@ class LoadBalancer:
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Failed to forward request: {str(e)}"
             )
+        finally:
+            instance.in_flight = max(0, instance.in_flight - 1)
 
 
 # Глобальный экземпляр балансировщика
@@ -457,10 +471,11 @@ async def get_aggregated_metrics():
         raise HTTPException(status_code=503, detail="Load balancer session not started")
 
     # ── Параллельный опрос всех инстансов ────────────────────────────────────
+    # Таймаут 5s на инстанс — LB должен ответить дашборду раньше его клиентского таймаута
     async def fetch_instance_metrics(inst: Instance) -> dict:
         try:
             url = f"{inst.url}metrics/"
-            async with async_timeout.timeout(10):
+            async with async_timeout.timeout(5):
                 async with lb.session.get(url, cookies=inst.cookies) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -516,6 +531,9 @@ async def get_aggregated_metrics():
             for g in gpus:
                 all_gpus.append({**g, "_instance": r["name"]})
 
+    # Словарь инстансов для быстрого доступа к in_flight по id
+    inst_map = {i.id: i for i in instances}
+
     aggregated = {
         "requests": {
             "total":                  total_requests,
@@ -523,7 +541,7 @@ async def get_aggregated_metrics():
             "avg_response_time_sec":  safe_avg(avg_latency_vals),
             "min_response_time_sec":  safe_min(min_latency_vals),
             "max_response_time_sec":  safe_max(max_latency_vals),
-            "p95_response_time_sec":  safe_avg(p95_latency_vals),  # avg of p95s
+            "p95_response_time_sec":  safe_avg(p95_latency_vals),
         },
         "system": {
             "cpu_percent": safe_avg(cpu_vals),
@@ -539,21 +557,22 @@ async def get_aggregated_metrics():
             },
             "gpu": all_gpus,
         },
-        # Мета — состояние самого LB и отдельные данные каждого инстанса
         "lb": {
             "total_instances":    len(instances),
             "active_instances":   len([i for i in instances if i.is_active]),
             "instances_polled":   len(ok_results),
             "instances_failed":   len(failed_results),
+            "total_in_flight":    sum(i.in_flight for i in instances),
             "failed_details":     [{"name": r["name"], "error": r["error"]} for r in failed_results],
         },
         "per_instance": [
             {
-                "id":     r["instance_id"],
-                "name":   r["name"],
-                "ok":     r["ok"],
-                "data":   r.get("data"),
-                "error":  r.get("error"),
+                "id":        r["instance_id"],
+                "name":      r["name"],
+                "ok":        r["ok"],
+                "in_flight": inst_map[r["instance_id"]].in_flight if r["instance_id"] in inst_map else 0,
+                "data":      r.get("data"),
+                "error":     r.get("error"),
             }
             for r in results
         ],
