@@ -35,7 +35,7 @@ def search_food_db(query: str) -> dict:
         if not products:
             return {"found": False, "query": query}
 
-        for product in products:
+        for product in products[:3]:
             n = product.get("nutriments", {})
             kcal = n.get("energy-kcal_100g") or n.get("energy-kcal")
             protein = n.get("proteins_100g")
@@ -43,16 +43,8 @@ def search_food_db(query: str) -> dict:
             carbs = n.get("carbohydrates_100g")
 
             if all(v is not None for v in [kcal, protein, fat, carbs]):
-                return {
-                    "found": True,
-                    "product_name": product.get("product_name", query),
-                    "per_100g": {
-                        "kcal": round(float(kcal), 1),
-                        "protein_g": round(float(protein), 1),
-                        "fat_g": round(float(fat), 1),
-                        "carbs_g": round(float(carbs), 1),
-                    }
-                }
+                name = (product.get("product_name") or query)[:40]
+                return {"found": True, "name": name, "kcal": round(float(kcal), 1), "protein_g": round(float(protein), 1), "fat_g": round(float(fat), 1), "carbs_g": round(float(carbs), 1)}
 
         return {"found": False, "query": query, "reason": "No complete nutriment data"}
 
