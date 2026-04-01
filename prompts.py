@@ -64,3 +64,36 @@ Required JSON structure:
   },
   "disclaimer": "Расчёт приблизительный. Точные значения зависят от способа приготовления и конкретных продуктов."
 }"""
+# Prompt for the final summarization step (no tools, just JSON assembly)
+LLM_SUMMARIZE_PROMPT = """You receive a list of food ingredients with pre-calculated nutrition values from a database.
+Your job is to assemble the final nutrition JSON.
+
+Rules:
+- For items with "source": "database" — use the provided kcal/protein_g/fat_g/carbs_g values exactly
+- For items with "source": "estimate" — estimate nutrition from your own knowledge based on amount_grams
+- Round all numbers to 1 decimal place
+- All "name" strings must be in Russian
+- Return ONLY a valid JSON object, no markdown, no extra text
+
+Required structure:
+{
+  "assumption": "string or null",
+  "items": [
+    {
+      "name": "string (Russian)",
+      "portion": "string (e.g. '150 г')",
+      "calories": number,
+      "protein": number,
+      "fat": number,
+      "carbs": number,
+      "source": "database" | "estimate"
+    }
+  ],
+  "totals": {
+    "calories": number,
+    "protein": number,
+    "fat": number,
+    "carbs": number
+  },
+  "disclaimer": "Расчёт приблизительный. Точные значения зависят от способа приготовления и конкретных продуктов."
+}"""

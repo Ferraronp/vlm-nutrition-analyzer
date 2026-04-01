@@ -1,147 +1,169 @@
 import json
-import logging
 import time
+import logging
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from groq import Groq
 
-from config import GROQ_API_KEY, TEMPERATURE, MAX_COMPLETION_TOKENS, TOP_P
-from prompts import LLM_SYSTEM_PROMPT
+from config import GROQ_API_KEY, TEMPERATURE, TOP_P
+from prompts import LLM_SYSTEM_PROMPT, LLM_SUMMARIZE_PROMPT
 
 logger = logging.getLogger(__name__)
 
-AGENT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-MAX_AGENT_ITERATIONS = 10
+LLM_MODEL = "llama-3.3-70b-versatile"
+
 
 # ---------------------------------------------------------------------------
-# Tools: реализация
+# OFF API
 # ---------------------------------------------------------------------------
 
 def search_food_db(query: str) -> dict:
     """Поиск продукта в Open Food Facts. Возвращает КБЖУ на 100г."""
-    try:
-        url = "https://world.openfoodfacts.org/cgi/search.pl"
-        params = {
-            "search_terms": query,
-            "search_simple": 1,
-            "action": "process",
-            "json": 1,
-            "page_size": 3,
-            "fields": "product_name,nutriments"
-        }
-        headers = {"User-Agent": "VLM-Nutrition-Analyzer/1.0 (https://github.com/Ferraronp/vlm-nutrition-analyzer)"}
-        for attempt in range(3):
-            try:
-                resp = requests.get(url, params=params, headers=headers, timeout=8)
-                if resp.status_code == 503:
-                    time.sleep(2 ** attempt)
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                break
-            except requests.RequestException:
-                if attempt == 2:
-                    raise
-                time.sleep(2 ** attempt)
-        else:
-            return {"found": False, "query": query, "reason": "Service unavailable after retries"}
-
-        products = data.get("products", [])
-        if not products:
-            return {"found": False, "query": query}
-
-        for product in products[:3]:
-            n = product.get("nutriments", {})
-            kcal = n.get("energy-kcal_100g") or n.get("energy-kcal")
-            protein = n.get("proteins_100g")
-            fat = n.get("fat_100g")
-            carbs = n.get("carbohydrates_100g")
-
-            if all(v is not None for v in [kcal, protein, fat, carbs]):
-                name = (product.get("product_name") or query)[:40]
-                return {"found": True, "name": name, "kcal": round(float(kcal), 1), "protein_g": round(float(protein), 1), "fat_g": round(float(fat), 1), "carbs_g": round(float(carbs), 1)}
-
-        return {"found": False, "query": query, "reason": "No complete nutriment data"}
-
-    except requests.RequestException as e:
-        logger.warning(f"OFF API error for '{query}': {e}")
-        return {"found": False, "query": query, "reason": str(e)}
-
-
-def calculate_nutrition(kcal_per100g: float, protein_per100g: float,
-                        fat_per100g: float, carbs_per100g: float,
-                        amount_grams: float) -> dict:
-    """Пересчитывает КБЖУ с 100г на указанное количество граммов."""
-    factor = amount_grams / 100.0
-    return {
-        "amount_grams": amount_grams,
-        "kcal": round(kcal_per100g * factor, 1),
-        "protein_g": round(protein_per100g * factor, 1),
-        "fat_g": round(fat_per100g * factor, 1),
-        "carbs_g": round(carbs_per100g * factor, 1),
+    url = "https://world.openfoodfacts.org/cgi/search.pl"
+    params = {
+        "search_terms": query,
+        "search_simple": 1,
+        "action": "process",
+        "json": 1,
+        "page_size": 3,
+        "fields": "product_name,nutriments"
     }
+    headers = {"User-Agent": "VLM-Nutrition-Analyzer/1.0 (https://github.com/Ferraronp/vlm-nutrition-analyzer)"}
 
-
-# ---------------------------------------------------------------------------
-# Tool schemas для Groq
-# ---------------------------------------------------------------------------
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_food_db",
-            "description": (
-                "Search Open Food Facts database for a food item. "
-                "Returns calories, protein, fat and carbohydrates per 100g. "
-                "Use this for each ingredient mentioned in the VLM description."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Food item name in English, e.g. 'chicken breast', 'white rice cooked'"
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_nutrition",
-            "description": (
-                "Calculate nutrition for a specific portion size given per-100g values. "
-                "Use this after search_food_db to get actual values for the portion from the image."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "kcal_per100g":    {"type": "number", "description": "Calories per 100g"},
-                    "protein_per100g": {"type": "number", "description": "Protein in grams per 100g"},
-                    "fat_per100g":     {"type": "number", "description": "Fat in grams per 100g"},
-                    "carbs_per100g":   {"type": "number", "description": "Carbohydrates in grams per 100g"},
-                    "amount_grams":    {"type": "number", "description": "Actual portion size in grams"}
-                },
-                "required": ["kcal_per100g", "protein_per100g", "fat_per100g", "carbs_per100g", "amount_grams"]
-            }
-        }
-    }
-]
-
-# ---------------------------------------------------------------------------
-# Tool dispatcher
-# ---------------------------------------------------------------------------
-
-def dispatch_tool(name: str, args: dict) -> str:
-    if name == "search_food_db":
-        result = search_food_db(**args)
-    elif name == "calculate_nutrition":
-        result = calculate_nutrition(**args)
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=4)
+            if resp.status_code == 503:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except requests.RequestException:
+            if attempt == 2:
+                return {"found": False, "query": query, "reason": "request failed"}
+            time.sleep(0.5 * (2 ** attempt))
     else:
-        result = {"error": f"Unknown tool: {name}"}
-    return json.dumps(result, ensure_ascii=False)
+        return {"found": False, "query": query, "reason": "Service unavailable after retries"}
+
+    for product in (data.get("products") or [])[:3]:
+        n = product.get("nutriments", {})
+        kcal    = n.get("energy-kcal_100g") or n.get("energy-kcal")
+        protein = n.get("proteins_100g")
+        fat     = n.get("fat_100g")
+        carbs   = n.get("carbohydrates_100g")
+        if all(v is not None for v in [kcal, protein, fat, carbs]):
+            name = (product.get("product_name") or query)[:40]
+            return {
+                "found": True,
+                "name": name,
+                "kcal":      round(float(kcal), 1),
+                "protein_g": round(float(protein), 1),
+                "fat_g":     round(float(fat), 1),
+                "carbs_g":   round(float(carbs), 1),
+            }
+
+    return {"found": False, "query": query, "reason": "No complete nutriment data"}
+
+
+def search_food_db_batch(queries: list) -> dict:
+    """Параллельный поиск нескольких ингредиентов."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_query = {executor.submit(search_food_db, q): q for q in queries}
+        for future in as_completed(future_to_query, timeout=15):
+            q = future_to_query[future]
+            try:
+                results[q] = future.result()
+            except Exception as e:
+                results[q] = {"found": False, "query": q, "reason": str(e)}
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Extract ingredients from VLM output via LLM
+# ---------------------------------------------------------------------------
+
+EXTRACT_PROMPT = """Extract all food ingredients from the text below.
+Return ONLY a JSON array of objects, no markdown, no extra text.
+Each object: {"ingredient": "name in English", "amount_grams": number}
+If amount is unclear, estimate in grams (e.g. 1 piece rice cake ~ 25g, 1 sausage ~ 30g, 1 tbsp sauce ~ 15g).
+Ignore non-quantifiable garnishes (sesame seeds sprinkled, possible broth, spices).
+
+Text:
+"""
+
+
+def extract_ingredients(client: Groq, vlm_output: str) -> list:
+    """Шаг 1: вытащить список ингредиентов с граммовкой через LLM."""
+    resp = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": EXTRACT_PROMPT + vlm_output}],
+        temperature=0,
+        max_tokens=512,
+        response_format={"type": "json_object"},
+    )
+    text = resp.choices[0].message.content or "[]"
+    try:
+        data = json.loads(text)
+        # модель может вернуть {"ingredients": [...]} или просто [...]
+        if isinstance(data, list):
+            return data
+        for v in data.values():
+            if isinstance(v, list):
+                return v
+    except Exception:
+        pass
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Build final JSON from DB results
+# ---------------------------------------------------------------------------
+
+def build_nutrition_json(client: Groq, vlm_output: str, ingredients: list, db_results: dict) -> str:
+    """Шаг 3: собрать финальный JSON через LLM с готовыми данными из базы."""
+    db_summary = []
+    for item in ingredients:
+        name = item.get("ingredient", "")
+        grams = item.get("amount_grams", 100)
+        db = db_results.get(name, {})
+        if db.get("found"):
+            factor = grams / 100.0
+            db_summary.append({
+                "ingredient": name,
+                "amount_grams": grams,
+                "source": "database",
+                "kcal":      round(db["kcal"] * factor, 1),
+                "protein_g": round(db["protein_g"] * factor, 1),
+                "fat_g":     round(db["fat_g"] * factor, 1),
+                "carbs_g":   round(db["carbs_g"] * factor, 1),
+            })
+        else:
+            db_summary.append({
+                "ingredient": name,
+                "amount_grams": grams,
+                "source": "estimate",
+            })
+
+    user_msg = (
+        "VLM description:\n" + vlm_output + "\n\n"
+        "Nutrition data from database:\n" + json.dumps(db_summary, ensure_ascii=False) + "\n\n"
+        "Return the final nutrition JSON."
+    )
+
+    resp = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": LLM_SUMMARIZE_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=TEMPERATURE,
+        max_tokens=1024,
+        top_p=TOP_P,
+        response_format={"type": "json_object"},
+    )
+    return resp.choices[0].message.content or "{}"
 
 
 # ---------------------------------------------------------------------------
@@ -153,121 +175,23 @@ class LLMService:
         self.client = Groq(api_key=GROQ_API_KEY)
 
     def generate(self, food_description: str) -> str:
-        messages = [
-            {"role": "system", "content": LLM_SYSTEM_PROMPT},
-            {"role": "user",   "content": food_description}
-        ]
+        # Шаг 1: извлечь ингредиенты
+        ingredients = extract_ingredients(self.client, food_description)
+        logger.info(f"[Pipeline] Extracted {len(ingredients)} ingredients: {[i.get('ingredient') for i in ingredients]}")
 
-        for iteration in range(MAX_AGENT_ITERATIONS):
-            try:
-                response = self.client.chat.completions.create(
-                    model=AGENT_MODEL,
-                    messages=messages,
-                    tools=TOOLS,
-                    tool_choice="auto",
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_COMPLETION_TOKENS,
-                    top_p=TOP_P,
-                )
-            except Exception as e:
-                # Groq бросает 400 когда модель генерирует невалидный tool call.
-                # В теле ошибки есть failed_generation с частичным JSON — пробуем его починить.
-                err_body = getattr(e, 'body', None) or {}
-                failed = (err_body.get('error') or {}).get('failed_generation', '')
-                if failed:
-                    logger.warning(f"[Agent] tool_use_failed, recovering from failed_generation")
-                    return self._fix_json(failed)
-                raise
+        if not ingredients:
+            return json.dumps({"clarification_required": "Не удалось определить ингредиенты из описания."}, ensure_ascii=False)
 
-            message = response.choices[0].message
+        # Шаг 2: параллельный поиск в OFF
+        queries = [i.get("ingredient", "") for i in ingredients if i.get("ingredient")]
+        db_results = search_food_db_batch(queries)
+        found = sum(1 for v in db_results.values() if v.get("found"))
+        logger.info(f"[Pipeline] OFF lookup: {found}/{len(queries)} found")
 
-            # Нет тул-коллов — агент дал финальный ответ
-            if not message.tool_calls:
-                return self._fix_json(message.content or "")
-
-            # Добавляем ответ ассистента с тул-коллами в историю
-            messages.append({
-                "role": "assistant",
-                "content": message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    }
-                    for tc in message.tool_calls
-                ]
-            })
-
-            # Выполняем все тул-коллы и добавляем результаты
-            for tc in message.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
-
-                logger.info(f"[Agent] Tool call: {tc.function.name}({args})")
-                result = dispatch_tool(tc.function.name, args)
-                logger.info(f"[Agent] Tool result: {result}")
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result
-                })
-
-        logger.warning("Agent reached max iterations without final answer")
-        return json.dumps({
-            "clarification_required": "Не удалось завершить анализ за отведённое количество шагов."
-        }, ensure_ascii=False)
-
-    def _fix_json(self, text: str) -> str:
-        """Чинит обрезанный JSON — дополняет недостающие поля по имеющимся данным."""
-        import re
-        text = text.strip()
-        for fence in ("```json", "```"):
-            if text.startswith(fence):
-                text = text[len(fence):]
-            if text.endswith(fence):
-                text = text[:-len(fence)]
-        text = text.strip()
-
-        try:
-            json.loads(text)
-            return text
-        except json.JSONDecodeError:
-            pass
-
-        # Извлекаем полные item-объекты из частичного JSON
-        items = []
-        items_match = re.search(r'"items"\s*:\s*\[', text)
-        if items_match:
-            for m in re.finditer(r'\{[^{}]+\}', text[items_match.end():], re.DOTALL):
-                try:
-                    items.append(json.loads(m.group()))
-                except Exception:
-                    pass
-
-        totals = {
-            "calories": round(sum(i.get("calories", 0) for i in items), 1),
-            "protein":  round(sum(i.get("protein",  0) for i in items), 1),
-            "fat":      round(sum(i.get("fat",      0) for i in items), 1),
-            "carbs":    round(sum(i.get("carbs",    0) for i in items), 1),
-        }
-
-        assumption_match = re.search(r'"assumption"\s*:\s*"([^"]*)"', text)
-        assumption = assumption_match.group(1) if assumption_match else None
-
-        logger.warning("JSON was truncated, reconstructed from partial data")
-        return json.dumps({
-            "assumption": assumption,
-            "items": items,
-            "totals": totals,
-            "disclaimer": "Расчёт приблизительный. Точные значения зависят от способа приготовления и конкретных продуктов."
-        }, ensure_ascii=False)
+        # Шаг 3: собрать финальный JSON
+        result = build_nutrition_json(self.client, food_description, ingredients, db_results)
+        logger.info("[Pipeline] Final JSON built")
+        return result
 
 
 # Global instance
