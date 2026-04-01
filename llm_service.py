@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 import requests
 from groq import Groq
 
@@ -8,7 +9,7 @@ from prompts import LLM_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-AGENT_MODEL = "llama-3.3-70b-versatile"
+AGENT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 MAX_AGENT_ITERATIONS = 10
 
 # ---------------------------------------------------------------------------
@@ -24,12 +25,25 @@ def search_food_db(query: str) -> dict:
             "search_simple": 1,
             "action": "process",
             "json": 1,
-            "page_size": 5,
+            "page_size": 3,
             "fields": "product_name,nutriments"
         }
-        resp = requests.get(url, params=params, timeout=8)
-        resp.raise_for_status()
-        data = resp.json()
+        headers = {"User-Agent": "VLM-Nutrition-Analyzer/1.0 (https://github.com/Ferraronp/vlm-nutrition-analyzer)"}
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, params=params, headers=headers, timeout=8)
+                if resp.status_code == 503:
+                    time.sleep(2 ** attempt)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except requests.RequestException:
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
+        else:
+            return {"found": False, "query": query, "reason": "Service unavailable after retries"}
 
         products = data.get("products", [])
         if not products:
@@ -145,21 +159,31 @@ class LLMService:
         ]
 
         for iteration in range(MAX_AGENT_ITERATIONS):
-            response = self.client.chat.completions.create(
-                model=AGENT_MODEL,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=TEMPERATURE,
-                max_tokens=MAX_COMPLETION_TOKENS,
-                top_p=TOP_P,
-            )
+            try:
+                response = self.client.chat.completions.create(
+                    model=AGENT_MODEL,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_COMPLETION_TOKENS,
+                    top_p=TOP_P,
+                )
+            except Exception as e:
+                # Groq бросает 400 когда модель генерирует невалидный tool call.
+                # В теле ошибки есть failed_generation с частичным JSON — пробуем его починить.
+                err_body = getattr(e, 'body', None) or {}
+                failed = (err_body.get('error') or {}).get('failed_generation', '')
+                if failed:
+                    logger.warning(f"[Agent] tool_use_failed, recovering from failed_generation")
+                    return self._fix_json(failed)
+                raise
 
             message = response.choices[0].message
 
             # Нет тул-коллов — агент дал финальный ответ
             if not message.tool_calls:
-                return message.content or ""
+                return self._fix_json(message.content or "")
 
             # Добавляем ответ ассистента с тул-коллами в историю
             messages.append({
@@ -198,6 +222,51 @@ class LLMService:
         logger.warning("Agent reached max iterations without final answer")
         return json.dumps({
             "clarification_required": "Не удалось завершить анализ за отведённое количество шагов."
+        }, ensure_ascii=False)
+
+    def _fix_json(self, text: str) -> str:
+        """Чинит обрезанный JSON — дополняет недостающие поля по имеющимся данным."""
+        import re
+        text = text.strip()
+        for fence in ("```json", "```"):
+            if text.startswith(fence):
+                text = text[len(fence):]
+            if text.endswith(fence):
+                text = text[:-len(fence)]
+        text = text.strip()
+
+        try:
+            json.loads(text)
+            return text
+        except json.JSONDecodeError:
+            pass
+
+        # Извлекаем полные item-объекты из частичного JSON
+        items = []
+        items_match = re.search(r'"items"\s*:\s*\[', text)
+        if items_match:
+            for m in re.finditer(r'\{[^{}]+\}', text[items_match.end():], re.DOTALL):
+                try:
+                    items.append(json.loads(m.group()))
+                except Exception:
+                    pass
+
+        totals = {
+            "calories": round(sum(i.get("calories", 0) for i in items), 1),
+            "protein":  round(sum(i.get("protein",  0) for i in items), 1),
+            "fat":      round(sum(i.get("fat",      0) for i in items), 1),
+            "carbs":    round(sum(i.get("carbs",    0) for i in items), 1),
+        }
+
+        assumption_match = re.search(r'"assumption"\s*:\s*"([^"]*)"', text)
+        assumption = assumption_match.group(1) if assumption_match else None
+
+        logger.warning("JSON was truncated, reconstructed from partial data")
+        return json.dumps({
+            "assumption": assumption,
+            "items": items,
+            "totals": totals,
+            "disclaimer": "Расчёт приблизительный. Точные значения зависят от способа приготовления и конкретных продуктов."
         }, ensure_ascii=False)
 
 
