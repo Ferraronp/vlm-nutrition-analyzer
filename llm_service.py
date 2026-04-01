@@ -122,16 +122,20 @@ def extract_ingredients(client: Groq, vlm_output: str) -> list:
 # ---------------------------------------------------------------------------
 
 def build_nutrition_json(client: Groq, vlm_output: str, ingredients: list, db_results: dict) -> str:
-    """Шаг 3: собрать финальный JSON через LLM с готовыми данными из базы."""
-    db_summary = []
+    """Шаг 3: собрать финальный JSON. Для database-items считаем сами, LLM только для estimate."""
+
+    # Считаем всё что нашли в базе — без участия LLM
+    computed_items = []
+    estimate_items = []
+
     for item in ingredients:
-        name = item.get("ingredient", "")
-        grams = item.get("amount_grams", 100)
-        db = db_results.get(name, {})
+        eng_name = item.get("ingredient", "")
+        grams = float(item.get("amount_grams", 100))
+        db = db_results.get(eng_name, {})
         if db.get("found"):
             factor = grams / 100.0
-            db_summary.append({
-                "ingredient": name,
+            computed_items.append({
+                "_eng": eng_name,
                 "amount_grams": grams,
                 "source": "database",
                 "kcal":      round(db["kcal"] * factor, 1),
@@ -140,16 +144,58 @@ def build_nutrition_json(client: Groq, vlm_output: str, ingredients: list, db_re
                 "carbs_g":   round(db["carbs_g"] * factor, 1),
             })
         else:
-            db_summary.append({
-                "ingredient": name,
+            estimate_items.append({
+                "_eng": eng_name,
                 "amount_grams": grams,
-                "source": "estimate",
             })
 
+    # Для estimate-items просим LLM дать КБЖУ — один вызов для всех сразу
+    estimate_results = {}
+    if estimate_items:
+        est_prompt = (
+            "For each food item below, estimate kcal, protein_g, fat_g, carbs_g for the given amount_grams.\n"
+            "Return ONLY JSON: {\"items\": [{\"ingredient\": \"...\", \"kcal\": N, \"protein_g\": N, \"fat_g\": N, \"carbs_g\": N}]}\n\n"
+            + json.dumps(estimate_items, ensure_ascii=False)
+        )
+        try:
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": est_prompt}],
+                temperature=0,
+                max_tokens=512,
+                response_format={"type": "json_object"},
+            )
+            est_data = json.loads(resp.choices[0].message.content or "{}")
+            for ei in est_data.get("items", []):
+                estimate_results[ei.get("ingredient", "").lower()] = ei
+        except Exception as e:
+            logger.warning(f"Estimate LLM call failed: {e}")
+
+    # Финальный вызов: переводим на русский и собираем JSON
+    all_items_for_llm = []
+    for ci in computed_items:
+        all_items_for_llm.append({
+            "ingredient": ci["_eng"],
+            "amount_grams": ci["amount_grams"],
+            "source": "database",
+            "kcal": ci["kcal"], "protein_g": ci["protein_g"],
+            "fat_g": ci["fat_g"], "carbs_g": ci["carbs_g"],
+        })
+    for ei in estimate_items:
+        key = ei["_eng"].lower()
+        nums = estimate_results.get(key, {})
+        all_items_for_llm.append({
+            "ingredient": ei["_eng"],
+            "amount_grams": ei["amount_grams"],
+            "source": "estimate",
+            "kcal": nums.get("kcal", 0), "protein_g": nums.get("protein_g", 0),
+            "fat_g": nums.get("fat_g", 0), "carbs_g": nums.get("carbs_g", 0),
+        })
+
     user_msg = (
-        "VLM description:\n" + vlm_output + "\n\n"
-        "Nutrition data from database:\n" + json.dumps(db_summary, ensure_ascii=False) + "\n\n"
-        "Return the final nutrition JSON."
+        "Translate ingredient names to Russian and assemble the final nutrition JSON.\n"
+        "Use EXACTLY the kcal/protein_g/fat_g/carbs_g values provided — do NOT recalculate.\n\n"
+        + json.dumps(all_items_for_llm, ensure_ascii=False)
     )
 
     resp = client.chat.completions.create(
@@ -158,12 +204,23 @@ def build_nutrition_json(client: Groq, vlm_output: str, ingredients: list, db_re
             {"role": "system", "content": LLM_SUMMARIZE_PROMPT},
             {"role": "user", "content": user_msg},
         ],
-        temperature=TEMPERATURE,
+        temperature=0,
         max_tokens=1024,
         top_p=TOP_P,
         response_format={"type": "json_object"},
     )
-    return resp.choices[0].message.content or "{}"
+    raw = resp.choices[0].message.content or "{}"
+
+    # Проставляем source из наших данных — по порядку items
+    source_order = [i["source"] for i in all_items_for_llm]
+    try:
+        data = json.loads(raw)
+        items = data.get("items", [])
+        for i, llm_item in enumerate(items):
+            llm_item["source"] = source_order[i] if i < len(source_order) else "estimate"
+        return json.dumps(data, ensure_ascii=False)
+    except Exception:
+        return raw
 
 
 # ---------------------------------------------------------------------------
