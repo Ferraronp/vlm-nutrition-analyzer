@@ -5,6 +5,8 @@ import time
 import tempfile
 import os
 import uuid
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from contextlib import asynccontextmanager
 import json
@@ -20,6 +22,9 @@ from batch_manager import initialize_batch_manager, shutdown_batch_manager
 request_times = []
 request_count = 0
 error_count = 0
+
+# Executor для синхронных вызовов (llm_service.generate блокирует event loop)
+_llm_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="llm")
 
 # Временная папка для сохранения загруженных изображений
 TEMP_IMAGE_DIR = Path("/tmp/food_nutrition")
@@ -121,14 +126,15 @@ async def process_image(image_source: str, is_file: bool = False):
 
     try:
         vlm_output = await vlm_service.generate(image_source)
-        result_str = llm_service.generate(vlm_output)  # строка JSON от LLM
 
-        # Парсим JSON в словарь
+        # llm_service.generate — синхронный (Groq SDK), запускаем в executor
+        # чтобы не блокировать event loop на время HTTP-запроса к Groq
+        loop = asyncio.get_event_loop()
+        result_str = await loop.run_in_executor(_llm_executor, llm_service.generate, vlm_output)
+
         try:
             analysis_obj = json.loads(result_str)
         except json.JSONDecodeError:
-            # Если не удалось распарсить, возвращаем как есть (например, уточнение)
-            # Но можно выбросить ошибку
             analysis_obj = {"raw": result_str}
 
         elapsed = time.time() - start_time
@@ -139,14 +145,23 @@ async def process_image(image_source: str, is_file: bool = False):
         return {
             "status": "success",
             "data": {
-                "analysis": analysis_obj,  # теперь это объект, а не строка
+                "analysis": analysis_obj,
                 "vlm_output": vlm_output
             }
         }
 
     except HTTPException:
+        # Время фиксируем даже при ошибке — иначе метрики врут
+        elapsed = time.time() - start_time
+        request_times.append(elapsed)
+        if len(request_times) > 1000:
+            request_times.pop(0)
         raise
     except Exception as e:
+        elapsed = time.time() - start_time
+        request_times.append(elapsed)
+        if len(request_times) > 1000:
+            request_times.pop(0)
         error_count += 1
         print(f"Error processing request: {str(e)}")
         raise HTTPException(
